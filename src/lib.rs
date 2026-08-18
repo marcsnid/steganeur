@@ -8,7 +8,7 @@
 //! - **Four steganography methods**: Arithmetic, Block, Huffman, and Rejection (Cachin, 2004)
 //! - **Reed-Solomon ECC layer** (`ecc`) for tolerating logprob drift
 //! - **Language model trait** for pluggable backends
-//! - **GPT-2 integration** via Candle (optional, feature `candle-lm`)
+//! - **llama.cpp integration** over HTTP (optional, feature `llamacpp`)
 //!
 //! ## Quick Start
 //!
