@@ -2,7 +2,7 @@
 name = "steganeur"
 version = "0.1.0"
 edition = "2024"
-description = "Neural linguistic steganography using arithmetic coding with language models"
+description = "Neural linguistic steganography: hide messages in LLM-generated text"
 authors = ["steganeur contributors"]
 license = "MIT OR Apache-2.0"
 
