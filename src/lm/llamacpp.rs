@@ -405,11 +405,44 @@ impl LlamaCppLM {
     ///
     /// Returns triples `(token_id, token_string, logprob)` sorted by logprob
     /// descending (highest probability first).
+    ///
+    /// Retries up to 3 times on transient failures (the server occasionally
+    /// returns `logprobs: null`, which is a known llama.cpp server issue
+    /// unrelated to steganeur).
     fn get_logprobs_completions(&self, prompt_tokens: &[TokenId]) -> Result<Vec<(TokenId, String, f64)>> {
         if prompt_tokens.is_empty() {
             return Err(Error::Lm("Cannot get logprobs for empty prompt".into()));
         }
 
+        let mut last_err = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
+            }
+            match self.get_logprobs_once(prompt_tokens) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    // Retry on transient server issues: empty logprobs,
+                    // parse errors, and HTTP errors. Non-transient errors
+                    // (like non-200 status) are returned immediately.
+                    let msg = e.to_string();
+                    let retryable = msg.contains("Empty logprobs")
+                        || msg.contains("Parse error")
+                        || msg.contains("HTTP error");
+                    if retryable && attempt < 2 {
+                        log::warn!("Attempt {}: {} (retrying)", attempt + 1, msg);
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Lm("get_logprobs_completions: all retries exhausted".into())))
+    }
+
+    /// Single attempt to get logprobs from the server.
+    fn get_logprobs_once(&self, prompt_tokens: &[TokenId]) -> Result<Vec<(TokenId, String, f64)>> {
         // The effective top_logprobs count: use the server's max or config's top_k.
         // llama.cpp's /v1/completions uses `logprobs` as integer = n_probs.
         // Cap at some reasonable maximum; 300 is the typical default.

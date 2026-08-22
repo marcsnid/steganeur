@@ -24,12 +24,13 @@
 use clap::{Parser, Subcommand};
 use steganeur::bitstream::Message;
 use steganeur::ecc::{rs_decode, rs_encode};
+use steganeur::framing::{frame_message, unframe_payload};
 use steganeur::lm::{DummyLM, LanguageModel};
 use steganeur::rejection::RejectionStega;
 use steganeur::steganography::{
     ArithmeticStega, BlockStega, HuffmanStega, StegaConfig, StegaMethod,
 };
-use std::io::Read;
+use std::io::{Read, Write};
 
 #[derive(Parser)]
 #[command(name = "steganeur")]
@@ -135,9 +136,13 @@ enum Command {
         #[arg(long, default_value_t = false)]
         stats: bool,
 
-    },
+        /// Read stdin as raw bytes without stripping a trailing newline.
+        /// Use this when piping binary data (e.g. ciphertext) via stdin.
+        /// --message-file is always raw.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
 
-    /// Decode cover text back into the secret message
+    },
     Decode {
         /// Context text used during encoding
         #[arg(short, long)]
@@ -192,7 +197,7 @@ enum Command {
         ecc_parity: usize,
 
         /// Max message bits to recover (auto-sized by default).
-        /// The decoder stops at the null terminator, so this is rarely needed.
+        /// The decoder stops at the end-of-stream marker, so this is rarely needed.
         #[arg(long)]
         max_bits: Option<usize>,
 
@@ -228,9 +233,13 @@ enum Command {
         #[arg(long, default_value_t = false)]
         stats: bool,
 
-    },
+        /// Treat the decoded message as text: validate UTF-8 and append a
+        /// trailing newline. Without this flag, raw message bytes are written
+        /// to stdout as-is (binary-safe).
+        #[arg(long, default_value_t = false)]
+        text: bool,
 
-    /// Interactive demo mode
+    },
     Demo {
         /// Steganography method
         #[arg(long, default_value = "arithmetic")]
@@ -348,36 +357,44 @@ fn encode_command(cmd: &CommandEncodeArgs) -> Result<(), Box<dyn std::error::Err
         cmd.arith_block_size,
     )?;
 
-    // Get the secret message
+    // Get the secret message as raw bytes.
+    // --message: CLI arg (text, .as_bytes()).
+    // --message-file: file read as raw bytes (binary-safe).
+    // stdin: raw bytes via read_to_end. By default a single trailing newline
+    //        is stripped (so `echo` works). --raw skips the strip for binary.
     let message_bytes = if let Some(msg) = &cmd.message {
         msg.as_bytes().to_vec()
     } else if let Some(path) = &cmd.message_file {
         std::fs::read(path)?
     } else {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        buf.trim().as_bytes().to_vec()
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        if !cmd.raw {
+            // Strip a single trailing \n or \r\n so `echo` and `printf` work.
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            }
+        }
+        buf
     };
 
-    // The arithmetic method's 32-bit read-ahead can flip the last bit of a
-    // 1-byte message at high temperature, so require at least 2 bytes for it.
-    // The block method is byte-exact at all sizes, so it has no such limit.
-    if cmd.method == "arithmetic" && message_bytes.len() < 2 {
-        return Err(format!(
-            "Arithmetic method requires a message of at least 2 bytes (got {}). \
-             Use --method block for shorter messages.",
-            message_bytes.len()
-        ).into());
+    if message_bytes.is_empty() {
+        return Err("Cannot encode an empty message.".into());
     }
 
-    // Build the payload: [message bytes] + [0x00 null terminator].
-    // The null terminator tells the decoder where the message ends, so no
-    // length prefix is needed. This works for text messages (which never
-    // contain 0x00). The cover text ends with punctuation, marking the end
-    // of the generated portion.
-    let mut payload = Vec::with_capacity(message_bytes.len() + 1);
-    payload.extend_from_slice(&message_bytes);
-    payload.push(0x00);
+    // Build the payload using chunked varint framing.
+    //
+    // Format: [varint(msg.len())][msg bytes][0x00]
+    //
+    // The varint length prefix tells the decoder exactly how many bytes to
+    // read, and the trailing 0x00 (varint 0) marks end of stream. This is
+    // binary-safe (0x00 in the message body is just data, not a sentinel),
+    // has no fixed int size or cap, and the overhead is 2 bytes flat for any
+    // message under 128 bytes.
+    let payload = frame_message(&message_bytes);
 
     // Optional ECC: encode payload with Reed-Solomon
     let payload = if cmd.ecc && cmd.ecc_parity > 0 {
@@ -469,6 +486,7 @@ struct CommandEncodeArgs {
     dummy: bool,
     dummy_vocab: usize,
     stats: bool,
+    raw: bool,
 }
 
 fn decode_command(cmd: &CommandDecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -502,11 +520,11 @@ fn decode_command(cmd: &CommandDecodeArgs) -> Result<(), Box<dyn std::error::Err
         buf.trim_end_matches(&['\n', '\r'][..]).to_string()
     };
 
-    // If a tokens file is provided, use exact token-ID-based decode (most reliable).
-    // Otherwise, decode using string matching against the cover text.
+    // Decode using string matching against the cover text.
     // The max_bits default is derived from the input size so long or ECC'd
-    // messages are never silently truncated (the null terminator gates
+    // messages are never silently truncated (the end-of-stream marker gates
     // extraction anyway).
+    //
     // Text-only decode: match token strings against the cover text.
 
     let default_bits = cover_text.len() * 8;
@@ -528,18 +546,29 @@ fn decode_command(cmd: &CommandDecodeArgs) -> Result<(), Box<dyn std::error::Err
         raw_bytes.clone()
     };
 
-    // The raw bytes may have leading zero bytes from the arithmetic decoder's
-    // read-ahead buffer; we skip those, then read until the null terminator.
-    let payload_bytes: Vec<u8> = raw_decoded.iter().copied().skip_while(|&b| b == 0).collect();
-    let message_bytes: Vec<u8> = payload_bytes
-        .iter()
-        .copied()
-        .take_while(|&b| b != 0)
-        .collect();
+    // Extract the message from the framed payload.
+    //
+    // The payload uses chunked varint framing:
+    //   [varint N][N bytes][0x00]
+    // The decoder reads N bytes, sees the 0x00 end-of-stream marker, and
+    // stops. Trailing bytes (read-ahead zero padding from the steganographic
+    // decoder) are ignored. This is binary-safe: 0x00 bytes inside the
+    // message are read by count, not by sentinel scanning.
+    let message_bytes = unframe_payload(&raw_decoded)?;
 
-    let decoded_text = String::from_utf8_lossy(&message_bytes);
-
-    println!("{}", decoded_text);
+    // Write the decoded message to stdout.
+    //
+    // Default: raw bytes via write_all (binary-safe, no trailing newline).
+    // --text: validate UTF-8 and append a trailing newline (for shell
+    //         pipelines that expect text output).
+    if cmd.text {
+        let decoded_text = String::from_utf8(message_bytes.clone())
+            .map_err(|e| format!("Decoded message is not valid UTF-8: {}. \
+                                   Drop --text for raw byte output.", e))?;
+        println!("{}", decoded_text);
+    } else {
+        std::io::stdout().write_all(&message_bytes)?;
+    }
     if cmd.stats {
         eprintln!();
         eprintln!("--- Stats ---");
@@ -579,6 +608,7 @@ struct CommandDecodeArgs {
     dummy: bool,
     dummy_vocab: usize,
     stats: bool,
+    text: bool,
 }
 
 fn demo_command(method_name: &str, temperature: f64, llama_url: &str, model: Option<&str>, vocab_size: usize, eos_token: u32, n_ctx: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -725,6 +755,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy,
             dummy_vocab,
             stats,
+            raw,
         } => encode_command(&CommandEncodeArgs {
             context,
             message,
@@ -748,6 +779,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy,
             dummy_vocab,
             stats,
+            raw,
         }),
         Command::Decode {
             context,
@@ -772,6 +804,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy,
             dummy_vocab,
             stats,
+            text,
         } => decode_command(&CommandDecodeArgs {
             context,
             cover,
@@ -795,6 +828,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy,
             dummy_vocab,
             stats,
+            text,
         }),
         Command::Demo {
             method,

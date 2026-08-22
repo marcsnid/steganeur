@@ -48,6 +48,7 @@ pub mod arithmetic;
 pub mod bitstream;
 pub mod ecc;
 pub mod error;
+pub mod framing;
 pub mod lm;
 pub mod rejection;
 pub mod steganography;
