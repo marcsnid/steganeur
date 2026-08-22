@@ -20,6 +20,11 @@ text that continues the prompt naturally, with the message encoded into the
 token choices. The recipient gives the cover text (and only the cover text) back
 to steganeur with the same model settings, and gets the message back.
 
+Messages can be text or arbitrary bytes, including ciphertext. For binary
+input via stdin, use `--raw`; for binary output, decode writes raw bytes by
+default (use `--text` for text output with a trailing newline). See
+[Binary messages and framing](#binary-messages-and-framing) below for details.
+
 **Encode:**
 
 ```bash
@@ -251,8 +256,10 @@ make the prose look slightly off.
 ### Error correction (ECC)
 
 A Reed-Solomon layer over GF(2^8) is available to tolerate bit errors from
-logprob drift or other noise. It wraps the message bytes before encoding and
-unwraps after decoding.
+logprob drift or other noise. It wraps the framed payload (length prefix +
+message + end-of-stream marker) before encoding and unwraps after decoding.
+Protecting the length prefix is important: a drifted length byte would
+corrupt the entire message.
 
 ```bash
 echo "Meet me at noon" \
@@ -276,6 +283,75 @@ cat cover.txt \
 to floor(N/2) byte errors. ECC is most useful on methods where errors are
 localized (block, rejection) and less effective on arithmetic, where a single
 bin flip cascades into an unbounded burst.
+
+## Binary messages and framing
+
+Steganeur handles arbitrary bytes, not just text. This matters for the real
+use case: encrypted messages (ciphertext), which are uniformly distributed
+bytes that frequently contain `0x00`.
+
+The payload uses chunked varint framing:
+
+```
+[varint N][N message bytes][0x00]
+```
+
+The varint length prefix tells the decoder exactly how many bytes to read, and
+the trailing `0x00` (varint 0) marks end of stream. The decoder reads by count,
+not by scanning for a sentinel, so `0x00` bytes inside the message are just
+data. Overhead is 2 bytes flat for any message under 128 bytes, scaling
+logarithmically for larger ones. There is no cap on message size.
+
+**Encode (binary via stdin):**
+
+```bash
+# Pipe ciphertext directly. --raw prevents stripping a trailing newline.
+cat ciphertext.bin \
+  | steganeur encode --raw --method block --block-bits 2 \
+    --temperature 2.0 --top-k 300 \
+    --context "She walked through the forest" \
+    --llama-url "http://127.0.0.1:11434" \
+    --model "Qwen3.6-27B-GGUF" \
+    --vocab-size 152064 --eos-token 151643
+```
+
+`--message-file` always reads raw bytes (no `--raw` needed):
+
+```bash
+steganeur encode --message-file ciphertext.bin --method block --block-bits 2 \
+  --temperature 2.0 --top-k 300 \
+  --context "She walked through the forest" \
+  --llama-url "http://127.0.0.1:11434" \
+  --model "Qwen3.6-27B-GGUF" \
+  --vocab-size 152064 --eos-token 151643
+```
+
+**Decode (binary output):**
+
+By default, decode writes raw message bytes to stdout with no trailing newline
+(binary-safe). Use `--text` to validate UTF-8 and add a trailing newline for
+shell pipelines:
+
+```bash
+# Binary output (for ciphertext or raw bytes):
+cat cover.txt \
+  | steganeur decode --method block --block-bits 2 \
+    --temperature 2.0 --top-k 300 \
+    --context "She walked through the forest" \
+    --llama-url "http://127.0.0.1:11434" \
+    --model "Qwen3.6-27B-GGUF" \
+    --vocab-size 152064 --eos-token 151643 \
+  > decrypted.bin
+
+# Text output (for human-readable messages):
+cat cover.txt \
+  | steganeur decode --text --method block --block-bits 2 \
+    --temperature 2.0 --top-k 300 \
+    --context "She walked through the forest" \
+    --llama-url "http://127.0.0.1:11434" \
+    --model "Qwen3.6-27B-GGUF" \
+    --vocab-size 152064 --eos-token 151643
+```
 
 ## Temperature and bit rate
 

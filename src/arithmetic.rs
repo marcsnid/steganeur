@@ -221,6 +221,41 @@ mod tests {
         }
     }
 
+    /// Regression: the arithmetic decoder must preserve leading 0x00 bytes
+    /// in the payload. The old `skip_while(|&b| b == 0)` hack in main.rs
+    /// stripped them, which silently corrupted binary payloads (e.g. ciphertext
+    /// whose first byte is 0x00). This test pins the correct behavior so any
+    /// future regression is caught.
+    #[test]
+    fn test_leading_zero_bytes_preserved() {
+        let n = 16usize;
+        let ids: Vec<u32> = (0..n as u32).collect();
+        let get_dist = |_ctx: &[u32]| -> Result<(FreqTable, Vec<u32>, Vec<String>)> {
+            Ok((FreqTable::uniform(n, MAX_FREQ), ids.clone(), vec![]))
+        };
+
+        for payload in [
+            vec![0x00u8, 0xAB],
+            vec![0x00, 0x00, 0xCD],
+            vec![0x01, 0x00],
+            vec![0x4D, 0x00],
+        ] {
+            let msg_bits = payload.len() * 8;
+            let (tokens, _, _) =
+                encode_message_to_tokens(&payload, msg_bits, get_dist, None, 500, 0).unwrap();
+            let (decoded, _) = decode_tokens_to_message(&tokens, get_dist, 0).unwrap();
+            // The leading payload bytes must be intact (trailing bytes are
+            // read-ahead zero padding, which framing is responsible for).
+            assert_eq!(
+                &decoded[..payload.len()],
+                &payload[..],
+                "payload {:02x?} did not round-trip; got {:02x?}",
+                payload,
+                decoded,
+            );
+        }
+    }
+
     #[test]
     fn test_roundtrip_uniform() {
         let n = 10usize;
