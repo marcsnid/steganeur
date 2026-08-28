@@ -38,14 +38,29 @@ use crate::error::{Error, Result};
 /// Produces: `[varint(msg.len())][msg bytes][0x00]`
 ///
 /// This is the batch framing (one chunk). For streaming, call
-/// [`encode_varint`] and extend with chunk bytes for each chunk, then push
-/// `0x00` at the end.
+/// [`frame_chunk`] for each chunk, then [`frame_end`] when the stream is
+/// done.
 pub fn frame_message(message: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(message.len() + 4);
     encode_varint(&mut out, message.len() as u64);
     out.extend_from_slice(message);
     out.push(0x00); // end of stream
     out
+}
+
+/// Frame a single chunk (no end-of-stream marker). Used for streaming encode:
+/// call this for each chunk of message bytes, then call [`frame_end`] when
+/// the input stream is done.
+pub fn frame_chunk(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 4);
+    encode_varint(&mut out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// The end-of-stream marker. Call this after the last [`frame_chunk`].
+pub fn frame_end() -> Vec<u8> {
+    vec![0x00]
 }
 
 /// Unframe a payload back into message bytes.
@@ -112,6 +127,109 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
         }
     }
     None // incomplete varint
+}
+
+/// Streaming unframer. Consumes bytes incrementally and emits complete
+/// chunk payloads as soon as they are available.
+///
+/// ## Usage
+///
+/// ```no_run
+/// use steganeur::framing::UnframeStream;
+///
+/// let mut unframer = UnframeStream::new();
+///
+/// // Feed bytes as they arrive from the steganographic decoder.
+/// // Each call returns any complete chunk payloads recovered.
+/// let chunks = unframer.push(b"\x05Hello\x00").unwrap();
+/// for chunk in chunks {
+///     // Process chunk (these are raw message bytes)
+/// }
+///
+/// // When the end-of-stream marker is seen, is_done() returns true.
+/// // Bytes after the marker are read-ahead padding and are ignored.
+/// ```
+pub struct UnframeStream {
+    /// Internal byte buffer. Incoming bytes are appended here.
+    buf: Vec<u8>,
+    /// Read position into `buf`.
+    pos: usize,
+    /// Whether the end-of-stream marker (varint 0) has been seen.
+    done: bool,
+}
+
+impl UnframeStream {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            pos: 0,
+            done: false,
+        }
+    }
+
+    /// Feed bytes and return any complete chunk payloads recovered so far.
+    ///
+    /// When the end-of-stream marker (varint 0) is seen, [`is_done`] becomes
+    /// true and subsequent calls return empty. Bytes after the end-of-stream
+    /// marker are ignored (they are read-ahead zero padding from the
+    /// steganographic decoder).
+    pub fn push(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
+        if self.done {
+            return Ok(vec![]);
+        }
+        self.buf.extend_from_slice(data);
+
+        let mut chunks = Vec::new();
+        loop {
+            let remaining = &self.buf[self.pos..];
+
+            // Try to parse a varint (chunk length or end-of-stream).
+            let (len, consumed) = match decode_varint(remaining) {
+                Some(v) => v,
+                None => break, // incomplete varint, need more bytes
+            };
+
+            if len == 0 {
+                // End-of-stream marker.
+                self.pos += consumed;
+                self.done = true;
+                break;
+            }
+
+            // Check if we have enough bytes for the chunk payload.
+            let len_usize = len as usize;
+            let chunk_end = self.pos + consumed + len_usize;
+            if chunk_end > self.buf.len() {
+                // Not enough data yet. Leave pos unchanged so the varint is
+                // re-parsed on the next push when more data arrives.
+                break;
+            }
+
+            // Extract the chunk payload.
+            let start = self.pos + consumed;
+            chunks.push(self.buf[start..chunk_end].to_vec());
+            self.pos = chunk_end;
+        }
+
+        // Compact the buffer when the consumed portion grows large.
+        if self.pos > 8192 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+
+        Ok(chunks)
+    }
+
+    /// Whether the end-of-stream marker has been seen.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+impl Default for UnframeStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +341,104 @@ mod tests {
         encode_varint(&mut framed, 100);
         framed.extend_from_slice(b"short");
         assert!(unframe_payload(&framed).is_err());
+    }
+
+    // ========================================================================
+    // Streaming unframer tests
+    // ========================================================================
+
+    #[test]
+    fn test_unframe_stream_single_chunk() {
+        let mut stream = UnframeStream::new();
+        let framed = frame_message(b"Hello world");
+        let chunks = stream.push(&framed).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], b"Hello world");
+        assert!(stream.is_done());
+    }
+
+    #[test]
+    fn test_unframe_stream_byte_by_byte() {
+        // Feed the framed payload one byte at a time.
+        let mut stream = UnframeStream::new();
+        let framed = frame_message(b"Test");
+        let mut all_chunks = Vec::new();
+        for byte in &framed {
+            let chunks = stream.push(&[*byte]).unwrap();
+            all_chunks.extend(chunks);
+        }
+        assert_eq!(all_chunks.len(), 1);
+        assert_eq!(all_chunks[0], b"Test");
+        assert!(stream.is_done());
+    }
+
+    #[test]
+    fn test_unframe_stream_multiple_chunks() {
+        let mut stream = UnframeStream::new();
+        let mut framed = Vec::new();
+        framed.extend(frame_chunk(b"Hello "));
+        framed.extend(frame_chunk(b"World!"));
+        framed.extend(frame_end());
+
+        let chunks = stream.push(&framed).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], b"Hello ");
+        assert_eq!(chunks[1], b"World!");
+        assert!(stream.is_done());
+    }
+
+    #[test]
+    fn test_unframe_stream_split_across_pushes() {
+        // Split the framed data across multiple push calls at arbitrary points.
+        let mut stream = UnframeStream::new();
+        let mut framed = Vec::new();
+        framed.extend(frame_chunk(b"AAAA"));
+        framed.extend(frame_chunk(b"BBBB"));
+        framed.extend(frame_end());
+
+        // Split: first 3 bytes, then 5, then the rest.
+        let mut all_chunks = Vec::new();
+        all_chunks.extend(stream.push(&framed[..3]).unwrap());
+        all_chunks.extend(stream.push(&framed[3..8]).unwrap());
+        all_chunks.extend(stream.push(&framed[8..]).unwrap());
+
+        assert_eq!(all_chunks.len(), 2);
+        assert_eq!(all_chunks[0], b"AAAA");
+        assert_eq!(all_chunks[1], b"BBBB");
+        assert!(stream.is_done());
+    }
+
+    #[test]
+    fn test_unframe_stream_binary_with_nulls() {
+        let msg = [0x00u8, 0xAB, 0x00, 0x00, 0xCD, 0xFF, 0x00];
+        let mut stream = UnframeStream::new();
+        let framed = frame_message(&msg);
+        let chunks = stream.push(&framed).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], msg);
+        assert!(stream.is_done());
+    }
+
+    #[test]
+    fn test_unframe_stream_trailing_padding_ignored() {
+        let mut stream = UnframeStream::new();
+        let mut framed = frame_message(b"Hi");
+        framed.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // read-ahead padding
+        let chunks = stream.push(&framed).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], b"Hi");
+        assert!(stream.is_done());
+    }
+
+    #[test]
+    fn test_unframe_stream_empty_chunks_ignored() {
+        // After end-of-stream, further pushes return nothing.
+        let mut stream = UnframeStream::new();
+        let framed = frame_message(b"Done");
+        let _ = stream.push(&framed).unwrap();
+        assert!(stream.is_done());
+        let chunks = stream.push(b"garbage").unwrap();
+        assert!(chunks.is_empty());
     }
 
     // ========================================================================

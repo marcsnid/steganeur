@@ -24,11 +24,12 @@
 use clap::{Parser, Subcommand};
 use steganeur::bitstream::Message;
 use steganeur::ecc::{rs_decode, rs_encode};
-use steganeur::framing::{frame_message, unframe_payload};
+use steganeur::framing::{frame_chunk, frame_end, frame_message, unframe_payload, UnframeStream};
 use steganeur::lm::{DummyLM, LanguageModel};
 use steganeur::rejection::RejectionStega;
 use steganeur::steganography::{
-    ArithmeticStega, BlockStega, HuffmanStega, StegaConfig, StegaMethod,
+    ArithmeticStega, ArithmeticStreamEncoder, ArithmeticStreamDecoder,
+    BlockStega, HuffmanStega, StegaConfig, StegaMethod,
 };
 use std::io::{Read, Write};
 
@@ -142,6 +143,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         raw: bool,
 
+        /// Streaming mode: read stdin in chunks and output cover text
+        /// incrementally as tokens are generated. Only supported with
+        /// --method arithmetic. Implies --raw.
+        #[arg(long, default_value_t = false)]
+        stream: bool,
+
     },
     Decode {
         /// Context text used during encoding
@@ -238,6 +245,12 @@ enum Command {
         /// to stdout as-is (binary-safe).
         #[arg(long, default_value_t = false)]
         text: bool,
+
+        /// Streaming mode: read stdin in chunks and output message bytes
+        /// incrementally as they are recovered. Only supported with
+        /// --method arithmetic.
+        #[arg(long, default_value_t = false)]
+        stream: bool,
 
     },
     Demo {
@@ -337,6 +350,124 @@ fn create_stega_method<'a>(
     }
 }
 
+fn stream_encode(
+    cmd: &CommandEncodeArgs,
+    lm: &dyn LanguageModel,
+    config: StegaConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if cmd.method != "arithmetic" {
+        return Err("--stream is only supported with --method arithmetic.".into());
+    }
+
+    let context = lm.tokenize(&cmd.context)?;
+    let mut encoder = ArithmeticStreamEncoder::new(lm, config, cmd.arith_block_size, &context);
+    let mut stdout = std::io::stdout();
+
+    // Output the context text first (the decoder expects context + generated text).
+    stdout.write_all(cmd.context.as_bytes())?;
+    stdout.flush()?;
+
+    // Read stdin in chunks, frame each chunk, feed to encoder.
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = std::io::stdin().read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let framed = frame_chunk(&buf[..n]);
+        let cover = encoder.push_bytes(&framed)?;
+        if !cover.is_empty() {
+            stdout.write_all(cover.as_bytes())?;
+            stdout.flush()?;
+        }
+    }
+
+    // End of stream: flush the encoder.
+    let cover = encoder.push_bytes(&frame_end())?;
+    if !cover.is_empty() {
+        stdout.write_all(cover.as_bytes())?;
+        stdout.flush()?;
+    }
+    let final_cover = encoder.finish()?;
+    if !final_cover.is_empty() {
+        stdout.write_all(final_cover.as_bytes())?;
+    }
+    stdout.flush()?;
+
+    if cmd.stats {
+        eprintln!("--- Stats (streaming) ---");
+        eprintln!("Cover parts: {}", encoder.cover_parts.len());
+    }
+
+    Ok(())
+}
+
+fn stream_decode(
+    cmd: &CommandDecodeArgs,
+    lm: &dyn LanguageModel,
+    config: StegaConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if cmd.method != "arithmetic" {
+        return Err("--stream is only supported with --method arithmetic.".into());
+    }
+
+    let context = lm.tokenize(&cmd.context)?;
+    let context_len = cmd.context.len();
+    let mut decoder = ArithmeticStreamDecoder::new(lm, config, cmd.arith_block_size, &context);
+    let mut unframer = UnframeStream::new();
+    let mut stdout = std::io::stdout();
+
+    // Read stdin in chunks, feed to decoder, unframe, output.
+    // The cover text starts with the context text, which the decoder must
+    // skip before matching tokens.
+    let mut skip = context_len;
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = std::io::stdin().read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let data = if skip > 0 {
+            if n <= skip {
+                skip -= n;
+                continue;
+            } else {
+                let s = skip;
+                skip = 0;
+                &buf[s..n]
+            }
+        } else {
+            &buf[..n]
+        };
+        let text = String::from_utf8_lossy(data);
+        let recovered = decoder.push_text(&text)?;
+        if !recovered.is_empty() {
+            let chunks = unframer.push(&recovered)?;
+            for chunk in chunks {
+                stdout.write_all(&chunk)?;
+                stdout.flush()?;
+            }
+        }
+    }
+
+    // Finish decoder, process remaining.
+    let final_bytes = decoder.finish()?;
+    if !final_bytes.is_empty() {
+        let chunks = unframer.push(&final_bytes)?;
+        for chunk in chunks {
+            stdout.write_all(&chunk)?;
+        }
+    }
+    stdout.flush()?;
+
+    if cmd.stats {
+        eprintln!("--- Stats (streaming) ---");
+        eprintln!("End of stream: {}", unframer.is_done());
+    }
+
+    Ok(())
+}
+
 fn encode_command(cmd: &CommandEncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let lm = create_lm(cmd.dummy, cmd.dummy_vocab, &cmd.llama_url, cmd.model.as_deref(), cmd.vocab_size, cmd.eos_token, cmd.n_ctx);
 
@@ -346,6 +477,12 @@ fn encode_command(cmd: &CommandEncodeArgs) -> Result<(), Box<dyn std::error::Err
         max_tokens: cmd.max_tokens.unwrap_or(steganeur::arithmetic::DEFAULT_MAX_TOKENS),
         seed: cmd.seed,
     };
+
+    // Streaming mode: read stdin in chunks, encode incrementally.
+    // Checked before create_stega_method since streaming uses its own encoder.
+    if cmd.stream {
+        return stream_encode(cmd, lm.as_ref(), config);
+    }
 
     let stega = create_stega_method(
         lm.as_ref(),
@@ -487,6 +624,7 @@ struct CommandEncodeArgs {
     dummy_vocab: usize,
     stats: bool,
     raw: bool,
+    stream: bool,
 }
 
 fn decode_command(cmd: &CommandDecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -498,6 +636,12 @@ fn decode_command(cmd: &CommandDecodeArgs) -> Result<(), Box<dyn std::error::Err
         max_tokens: cmd.max_bits.unwrap_or(steganeur::arithmetic::DEFAULT_MAX_TOKENS),
         seed: cmd.seed,
     };
+
+    // Streaming mode: read stdin in chunks, decode incrementally.
+    // Checked before create_stega_method since streaming uses its own decoder.
+    if cmd.stream {
+        return stream_decode(cmd, lm.as_ref(), config);
+    }
 
     let stega = create_stega_method(
         lm.as_ref(),
@@ -609,6 +753,7 @@ struct CommandDecodeArgs {
     dummy_vocab: usize,
     stats: bool,
     text: bool,
+    stream: bool,
 }
 
 fn demo_command(method_name: &str, temperature: f64, llama_url: &str, model: Option<&str>, vocab_size: usize, eos_token: u32, n_ctx: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -756,6 +901,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy_vocab,
             stats,
             raw,
+            stream,
         } => encode_command(&CommandEncodeArgs {
             context,
             message,
@@ -780,6 +926,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy_vocab,
             stats,
             raw,
+            stream,
         }),
         Command::Decode {
             context,
@@ -805,6 +952,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy_vocab,
             stats,
             text,
+            stream,
         } => decode_command(&CommandDecodeArgs {
             context,
             cover,
@@ -829,6 +977,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy_vocab,
             stats,
             text,
+            stream,
         }),
         Command::Demo {
             method,

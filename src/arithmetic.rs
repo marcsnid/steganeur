@@ -80,7 +80,7 @@ pub fn subdivide(low: u64, high: u64, table: &FreqTable) -> Vec<u64> {
     (0..table.len()).map(|i| low + (table.cum[i + 1] * range) / table.total).collect()
 }
 
-fn find_selection(cum: &[u64], value: u64) -> usize {
+pub fn find_selection(cum: &[u64], value: u64) -> usize {
     match cum.binary_search(&value) {
         Ok(i) => i + 1,
         Err(i) => i,
