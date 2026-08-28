@@ -305,6 +305,350 @@ impl<'a> ArithmeticStega<'a> {
     }
 }
 
+// ============================================================================
+// Streaming arithmetic encode/decode
+// ============================================================================
+//
+// These structs allow incremental encoding and decoding: message bytes are
+// fed in chunks and cover text is produced as tokens are generated; cover
+// text is fed in chunks and message bytes are recovered as tokens are matched.
+// This enables streaming I/O at the CLI level (pipe a large file in, get cover
+// text streaming out) without buffering the entire message and cover text.
+//
+// The caller is responsible for framing: feed framed bytes (from `frame_chunk`
+// / `frame_end`) to the encoder, and feed the encoder's output to the
+// `UnframeStream` on decode.
+
+/// Streaming arithmetic encoder. Encodes framed bytes into cover text,
+/// maintaining interval state across calls.
+pub struct ArithmeticStreamEncoder<'a> {
+    lm: &'a dyn LanguageModel,
+    config: StegaConfig,
+    block_size: usize,
+    /// Context tokens (context + generated tokens so far).
+    context: Vec<TokenId>,
+    /// Current arithmetic interval.
+    cur_interval: [u64; 2],
+    /// Bit buffer: message bits accumulated from framed bytes.
+    message_bits: Vec<u8>,
+    /// Bit position: how many bits have been consumed.
+    bit_pos: usize,
+    /// Cover text parts generated so far (for output).
+    pub cover_parts: Vec<String>,
+    /// Whether `finish` has been called (no more input).
+    finished: bool,
+}
+
+impl<'a> ArithmeticStreamEncoder<'a> {
+    pub fn new(lm: &'a dyn LanguageModel, config: StegaConfig, block_size: usize, context: &[TokenId]) -> Self {
+        ArithmeticStreamEncoder {
+            lm,
+            config,
+            block_size,
+            context: context.to_vec(),
+            cur_interval: [0, arithmetic::MAX_VAL],
+            message_bits: Vec::new(),
+            bit_pos: 0,
+            cover_parts: Vec::new(),
+            finished: false,
+        }
+    }
+
+    /// Feed framed bytes and return any new cover text generated.
+    ///
+    /// The bytes should be the output of `frame_chunk` (or `frame_end` for
+    /// the final call, followed by `finish`).
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<String> {
+        if self.finished {
+            return Ok(String::new());
+        }
+        // Convert bytes to bits and append.
+        for &byte in bytes {
+            for j in (0..8).rev() {
+                self.message_bits.push((byte >> j) & 1);
+            }
+        }
+        self.encode_step(false)
+    }
+
+    /// Signal that no more bytes are coming. Flushes the arithmetic interval
+    /// and returns the final cover text (including punctuation if needed).
+    pub fn finish(&mut self) -> Result<String> {
+        if self.finished {
+            return Ok(String::new());
+        }
+        self.finished = true;
+        let mut cover = self.encode_step(true)?;
+
+        // Add punctuation if the last token doesn't end with sentence punctuation.
+        if self.cover_parts.last().is_none_or(|s| !arithmetic::is_sentence_end(s)) {
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if let Some((punct_id, punct_str)) = find_punctuation_token(&filtered.ids, &filtered.strings) {
+                self.context.push(punct_id);
+                self.cover_parts.push(punct_str.clone());
+                cover.push_str(&punct_str);
+            }
+        }
+        Ok(cover)
+    }
+
+    /// Run the encode loop, generating as many tokens as possible.
+    ///
+    /// If `flush` is false, leave a 32-bit reserve (don't consume the last
+    /// 32 bits, because more real bits may arrive). If `flush` is true,
+    /// encode until the stop condition (32 bits past the end with zero
+    /// padding).
+    fn encode_step(&mut self, flush: bool) -> Result<String> {
+        let eos = self.lm.eos_token();
+        let max_tokens = self.config.max_tokens.max(arithmetic::DEFAULT_MAX_TOKENS);
+        let new_cover_start = self.cover_parts.len();
+
+        // During normal operation, reserve 32 bits for the flush.
+        // During flush, encode 32 bits past the end (zero-padded).
+        let stop_at = if flush {
+            self.message_bits.len() + 32
+        } else {
+            self.message_bits.len().saturating_sub(32)
+        };
+
+        for _ in 0..max_tokens {
+            // Error-resilient block reset.
+            if self.block_size > 0 && !self.cover_parts.is_empty() && self.cover_parts.len() % self.block_size == 0 {
+                self.cur_interval = [0, arithmetic::MAX_VAL];
+            }
+
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if filtered.probs.is_empty() {
+                break;
+            }
+            let table = arithmetic::FreqTable::from_probs(&filtered.probs, arithmetic::MAX_FREQ);
+            if table.total == 0 || table.is_empty() {
+                break;
+            }
+
+            let cum = arithmetic::subdivide(self.cur_interval[0], self.cur_interval[1], &table);
+
+            // Read PRECISION bits from the bit buffer, padding with zeros.
+            let remaining = self.message_bits.len().saturating_sub(self.bit_pos);
+            let bits_to_use = remaining.min(arithmetic::PRECISION as usize);
+            let mut padded = self.message_bits
+                .get(self.bit_pos..self.bit_pos + bits_to_use)
+                .unwrap_or(&[])
+                .to_vec();
+            padded.resize(arithmetic::PRECISION as usize, 0);
+            let message_idx = arithmetic::bits_msb_to_int(&padded);
+
+            let selection = arithmetic::find_selection(&cum, message_idx);
+            let token = filtered.ids[selection];
+            let token_str = filtered.strings.get(selection).cloned().unwrap_or_default();
+
+            let new_low = if selection > 0 { cum[selection - 1] } else { self.cur_interval[0] };
+            let new_high = cum[selection];
+            let low_bits = arithmetic::int_to_bits_msb(new_low, arithmetic::PRECISION);
+            let high_bits = arithmetic::int_to_bits_msb(new_high - 1, arithmetic::PRECISION);
+            let n_fixed = arithmetic::num_same_from_beg(&low_bits, &high_bits);
+            self.bit_pos += n_fixed;
+
+            let mut nlb = low_bits[n_fixed..].to_vec();
+            nlb.resize(arithmetic::PRECISION as usize, 0);
+            let mut nhb = high_bits[n_fixed..].to_vec();
+            nhb.resize(arithmetic::PRECISION as usize, 1);
+            self.cur_interval[0] = arithmetic::bits_msb_to_int(&nlb);
+            self.cur_interval[1] = arithmetic::bits_msb_to_int(&nhb) + 1;
+
+            self.context.push(token);
+            self.cover_parts.push(token_str);
+
+            if let Some(et) = eos && token == et {
+                break;
+            }
+
+            // Stop conditions: match the batch encoder's structure (check
+            // at the BOTTOM of the loop, after generating a token).
+            if self.bit_pos >= stop_at {
+                if flush {
+                    if self.cover_parts.last().is_some_and(|s| arithmetic::is_sentence_end(s)) {
+                        break;
+                    }
+                    if self.cover_parts.len() > stop_at / 8 + 50 {
+                        break;
+                    }
+                } else {
+                    // Non-flush: stop after reaching the reserve threshold.
+                    break;
+                }
+            }
+            if flush && self.bit_pos >= self.message_bits.len() + arithmetic::PRECISION as usize * 2 {
+                break;
+            }
+        }
+
+        // Return only the cover text generated in this step.
+        Ok(self.cover_parts[new_cover_start..].concat())
+    }
+}
+
+/// Streaming arithmetic decoder. Matches cover text against token strings,
+/// recovers bits from the interval narrowing, and returns decoded bytes.
+pub struct ArithmeticStreamDecoder<'a> {
+    lm: &'a dyn LanguageModel,
+    config: StegaConfig,
+    block_size: usize,
+    /// Context tokens (context + matched tokens so far).
+    context: Vec<TokenId>,
+    /// Current arithmetic interval.
+    cur_interval: [u64; 2],
+    /// Recovered message bits.
+    message_bits: Vec<u8>,
+    /// Token count (for block resets).
+    token_count: usize,
+    /// Buffered cover text awaiting token matching.
+    text_buffer: String,
+    /// Whether `finish` has been called (no more input coming).
+    finishing: bool,
+    /// Number of bits already returned as complete bytes.
+    bits_returned: usize,
+}
+
+impl<'a> ArithmeticStreamDecoder<'a> {
+    pub fn new(lm: &'a dyn LanguageModel, config: StegaConfig, block_size: usize, context: &[TokenId]) -> Self {
+        ArithmeticStreamDecoder {
+            lm,
+            config,
+            block_size,
+            context: context.to_vec(),
+            cur_interval: [0, arithmetic::MAX_VAL],
+            message_bits: Vec::new(),
+            token_count: 0,
+            text_buffer: String::new(),
+            finishing: false,
+            bits_returned: 0,
+        }
+    }
+
+    /// Feed cover text and return any recovered bytes.
+    ///
+    /// The returned bytes are the raw framed payload (not unframed). The
+    /// caller should feed them to an `UnframeStream` to extract message
+    /// chunks.
+    pub fn push_text(&mut self, text: &str) -> Result<Vec<u8>> {
+        self.text_buffer.push_str(text);
+        self.decode_step()
+    }
+
+    /// Signal that no more cover text is coming. Process any remaining
+    /// buffered text and return final recovered bytes.
+    pub fn finish(&mut self) -> Result<Vec<u8>> {
+        self.finishing = true;
+        self.decode_step()?;
+        // Return all remaining bits, including the partial last byte
+        // (padded with zeros). These are read-ahead padding bits that the
+        // unframer will ignore after the end-of-stream marker.
+        let remaining = &self.message_bits[self.bits_returned..];
+        let mut bytes = Vec::with_capacity(remaining.len().div_ceil(8));
+        for chunk in remaining.chunks(8) {
+            let mut b = 0u8;
+            for (j, &bit) in chunk.iter().enumerate() {
+                b |= bit << (7 - j);
+            }
+            bytes.push(b);
+        }
+        self.bits_returned = self.message_bits.len();
+        Ok(bytes)
+    }
+
+    fn decode_step(&mut self) -> Result<Vec<u8>> {
+        loop {
+            if self.text_buffer.is_empty() {
+                break;
+            }
+            // Error-resilient block reset.
+            if self.block_size > 0 && self.token_count > 0 && self.token_count % self.block_size == 0 {
+                self.cur_interval = [0, arithmetic::MAX_VAL];
+            }
+
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if filtered.probs.is_empty() {
+                break;
+            }
+            let table = arithmetic::FreqTable::from_probs(&filtered.probs, arithmetic::MAX_FREQ);
+            if table.total == 0 || table.is_empty() {
+                break;
+            }
+
+            // Find the token whose string matches the beginning of the buffer.
+            let mut matched = None;
+            let mut best_len = 0usize;
+            for (i, token_str) in filtered.strings.iter().enumerate() {
+                if token_str.is_empty() {
+                    continue;
+                }
+                if token_str.len() > best_len && self.text_buffer.starts_with(token_str.as_str()) {
+                    matched = Some((i, filtered.ids[i], token_str.len()));
+                    best_len = token_str.len();
+                }
+            }
+
+            if let Some((idx, token_id, len)) = matched {
+                let cum = arithmetic::subdivide(self.cur_interval[0], self.cur_interval[1], &table);
+                let new_low = if idx > 0 { cum[idx - 1] } else { self.cur_interval[0] };
+                let new_high = cum[idx];
+                let low_bits = arithmetic::int_to_bits_msb(new_low, arithmetic::PRECISION);
+                let high_bits = arithmetic::int_to_bits_msb(new_high - 1, arithmetic::PRECISION);
+                let n_fixed = arithmetic::num_same_from_beg(&low_bits, &high_bits);
+                if n_fixed > 0 {
+                    self.message_bits.extend_from_slice(&low_bits[..n_fixed]);
+                }
+                let mut nlb = low_bits[n_fixed..].to_vec();
+                nlb.resize(arithmetic::PRECISION as usize, 0);
+                let mut nhb = high_bits[n_fixed..].to_vec();
+                nhb.resize(arithmetic::PRECISION as usize, 1);
+                self.cur_interval[0] = arithmetic::bits_msb_to_int(&nlb);
+                self.cur_interval[1] = arithmetic::bits_msb_to_int(&nhb) + 1;
+
+                self.context.push(token_id);
+                self.token_count += 1;
+                self.text_buffer.drain(..len);
+            } else {
+                // No token matched. This could mean:
+                // 1. Not enough text yet (need more input) -- buffer and wait.
+                // 2. The remaining text is trailing whitespace/garbage.
+                // During push_text, we can't distinguish these, so we break
+                // and wait for more input. During finish (no more input
+                // coming), skip unmatched characters.
+                if self.finishing {
+                    let skip = self.text_buffer.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    if skip >= self.text_buffer.len() {
+                        self.text_buffer.clear();
+                    } else {
+                        self.text_buffer.drain(..skip);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Convert recovered bits to complete bytes only. Partial bits
+        // (not a multiple of 8) are kept for the next call. This prevents
+        // returning garbage bytes when bit recovery doesn't align to byte
+        // boundaries across streaming calls.
+        let total_bits = self.message_bits.len();
+        let complete_bits = (total_bits / 8) * 8;
+        let new_bits = &self.message_bits[self.bits_returned..complete_bits];
+        let mut bytes = Vec::with_capacity(new_bits.len() / 8);
+        for chunk in new_bits.chunks(8) {
+            let mut b = 0u8;
+            for (j, &bit) in chunk.iter().enumerate() {
+                b |= bit << (7 - j);
+            }
+            bytes.push(b);
+        }
+        self.bits_returned = complete_bits;
+        Ok(bytes)
+    }
+}
+
 pub struct BlockStega<'a> {
     lm: &'a dyn LanguageModel,
     config: StegaConfig,
@@ -684,6 +1028,197 @@ impl<'a> StegaMethod<'a> {
     }
     pub fn decode_text(&self, context_text: &str, cover_text: &str, max_message_bits: usize) -> Result<(Vec<u8>, usize)> {
         match self { StegaMethod::Arithmetic(s) => s.decode_text(context_text, cover_text, max_message_bits), StegaMethod::Block(s) => s.decode_text(context_text, cover_text, max_message_bits), StegaMethod::Huffman(s) => s.decode_text(context_text, cover_text, max_message_bits), StegaMethod::Rejection(s) => s.decode_text(context_text, cover_text, max_message_bits) }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::framing::{frame_chunk, frame_end, frame_message, UnframeStream};
+    use crate::lm::{DummyLM, LanguageModel};
+
+    fn make_lm(vocab: usize) -> DummyLM {
+        let probs: Vec<f64> = (0..vocab)
+            .map(|i| 1.0 / (i as f64 + 1.0))
+            .collect();
+        let strings: Vec<String> = (0..vocab)
+            .map(|i| format!("t{} ", i))
+            .collect();
+        DummyLM::new(vocab)
+            .with_probs(probs)
+            .with_token_strings(strings)
+    }
+
+    #[test]
+    fn test_stream_vs_batch_identical_output() {
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 500,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret = b"Hello streaming world test message";
+
+        // Batch encode
+        let payload = frame_message(secret);
+        let msg = crate::bitstream::Message::from_bytes(payload.clone());
+        let stega = ArithmeticStega::new(&lm, config.clone(), 16);
+        let (batch_tokens, _, batch_cover) = stega.encode(&ctx, msg.data(), msg.num_bits()).unwrap();
+
+        // Streaming encode
+        let mut encoder = ArithmeticStreamEncoder::new(&lm, config, 16, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+
+        assert_eq!(cover, batch_cover, "streaming cover text differs from batch cover text");
+        assert_eq!(encoder.cover_parts.len(), batch_tokens.len(), "token count differs");
+    }
+
+    #[test]
+    fn test_stream_encode_decode_single_chunk() {
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 500,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret = b"Hello streaming world";
+
+        let mut encoder = ArithmeticStreamEncoder::new(&lm, config.clone(), 0, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+        assert!(!cover.is_empty());
+
+        let mut decoder = ArithmeticStreamDecoder::new(&lm, config, 0, &ctx);
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
+    }
+
+    #[test]
+    fn test_stream_encode_decode_multi_chunk() {
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 1000,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let chunk1 = b"First chunk of data";
+        let chunk2 = b"Second chunk here";
+        let chunk3 = b"Third and final";
+
+        let mut encoder = ArithmeticStreamEncoder::new(&lm, config.clone(), 0, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(chunk1)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_chunk(chunk2)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_chunk(chunk3)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+
+        let mut decoder = ArithmeticStreamDecoder::new(&lm, config, 0, &ctx);
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], chunk1);
+        assert_eq!(chunks[1], chunk2);
+        assert_eq!(chunks[2], chunk3);
+        assert!(unframer.is_done());
+    }
+
+    #[test]
+    fn test_stream_encode_decode_binary_with_nulls() {
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 500,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret: Vec<u8> = vec![0x00, 0xAB, 0x00, 0x00, 0xCD, 0xFF, 0x00, 0x42];
+
+        let mut encoder = ArithmeticStreamEncoder::new(&lm, config.clone(), 0, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(&secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+
+        let mut decoder = ArithmeticStreamDecoder::new(&lm, config, 0, &ctx);
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
+    }
+
+    #[test]
+    fn test_stream_decode_increments() {
+        // Feed cover text one character at a time to the decoder.
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 500,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret = b"Incremental decode test";
+
+        let mut encoder = ArithmeticStreamEncoder::new(&lm, config.clone(), 0, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+
+        // Decode: feed one character at a time.
+        let mut decoder = ArithmeticStreamDecoder::new(&lm, config, 0, &ctx);
+        let mut all_bytes = Vec::new();
+        for ch in cover.chars() {
+            let bytes = decoder.push_text(&ch.to_string()).unwrap();
+            all_bytes.extend(bytes);
+        }
+        let final_bytes = decoder.finish().unwrap();
+        all_bytes.extend(final_bytes);
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
     }
 }
 
