@@ -369,18 +369,21 @@ fn stream_encode(
 
     // Read stdin in chunks, frame each chunk, feed to encoder.
     let mut buf = [0u8; 4096];
-    let mut all_input = Vec::new();
     loop {
         let n = std::io::stdin().read(&mut buf)?;
         if n == 0 {
             break;
         }
-        all_input.extend_from_slice(&buf[..n]);
+        let framed = frame_chunk(&buf[..n]);
+        let cover = encoder.push_bytes(&framed)?;
+        if !cover.is_empty() {
+            stdout.write_all(cover.as_bytes())?;
+            stdout.flush()?;
+        }
     }
-    // Push all framed bytes at once, then end-of-stream.
-    let mut framed = frame_chunk(&all_input);
-    framed.extend(frame_end());
-    let cover = encoder.push_bytes(&framed)?;
+
+    // End of stream: flush the encoder.
+    let cover = encoder.push_bytes(&frame_end())?;
     if !cover.is_empty() {
         stdout.write_all(cover.as_bytes())?;
         stdout.flush()?;

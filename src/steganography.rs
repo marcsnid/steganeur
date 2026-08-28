@@ -192,6 +192,10 @@ impl<'a> ArithmeticStega<'a> {
             message, num_msg_bits,
             |tokens| {
                 let full_ctx = [ctx.as_slice(), tokens].concat();
+                log::debug!(
+                    "batch encode: ctx_len={}, tokens_len={}, bit_pos may differ",
+                    ctx.len(), tokens.len()
+                );
                 let (table, token_ids, token_strings) = self.get_filtered_dist_full(&full_ctx)?;
                 Ok((table, token_ids, token_strings))
             },
