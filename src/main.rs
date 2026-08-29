@@ -26,10 +26,12 @@ use steganeur::bitstream::Message;
 use steganeur::ecc::{rs_decode, rs_encode};
 use steganeur::framing::{frame_chunk, frame_end, frame_message, unframe_payload, UnframeStream};
 use steganeur::lm::{DummyLM, LanguageModel};
-use steganeur::rejection::RejectionStega;
+use steganeur::rejection::{RejectionStega, RejectionStreamEncoder, RejectionStreamDecoder};
 use steganeur::steganography::{
     ArithmeticStega, ArithmeticStreamEncoder, ArithmeticStreamDecoder,
-    BlockStega, HuffmanStega, StegaConfig, StegaMethod,
+    BlockStega, BlockStreamEncoder, BlockStreamDecoder,
+    HuffmanStega, HuffmanStreamEncoder, HuffmanStreamDecoder,
+    StegaConfig, StegaMethod,
 };
 use std::io::{Read, Write};
 
@@ -144,8 +146,7 @@ enum Command {
         raw: bool,
 
         /// Streaming mode: read stdin in chunks and output cover text
-        /// incrementally as tokens are generated. Only supported with
-        /// --method arithmetic. Implies --raw.
+        /// incrementally as tokens are generated. Implies --raw.
         #[arg(long, default_value_t = false)]
         stream: bool,
 
@@ -247,8 +248,7 @@ enum Command {
         text: bool,
 
         /// Streaming mode: read stdin in chunks and output message bytes
-        /// incrementally as they are recovered. Only supported with
-        /// --method arithmetic.
+        /// incrementally as they are recovered.
         #[arg(long, default_value_t = false)]
         stream: bool,
 
@@ -355,17 +355,62 @@ fn stream_encode(
     lm: &dyn LanguageModel,
     config: StegaConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if cmd.method != "arithmetic" {
-        return Err("--stream is only supported with --method arithmetic.".into());
-    }
-
     let context = lm.tokenize(&cmd.context)?;
-    let mut encoder = ArithmeticStreamEncoder::new(lm, config, cmd.arith_block_size, &context);
     let mut stdout = std::io::stdout();
 
     // Output the context text first (the decoder expects context + generated text).
     stdout.write_all(cmd.context.as_bytes())?;
     stdout.flush()?;
+
+    // Create the appropriate streaming encoder for the method.
+    enum StreamEncoder<'a> {
+        Arithmetic(ArithmeticStreamEncoder<'a>),
+        Block(BlockStreamEncoder<'a>),
+        Huffman(HuffmanStreamEncoder<'a>),
+        Rejection(RejectionStreamEncoder<'a>),
+    }
+    impl<'a> StreamEncoder<'a> {
+        fn push_bytes(&mut self, bytes: &[u8]) -> steganeur::error::Result<String> {
+            match self {
+                Self::Arithmetic(e) => e.push_bytes(bytes),
+                Self::Block(e) => e.push_bytes(bytes),
+                Self::Huffman(e) => e.push_bytes(bytes),
+                Self::Rejection(e) => e.push_bytes(bytes),
+            }
+        }
+        fn finish(&mut self) -> steganeur::error::Result<String> {
+            match self {
+                Self::Arithmetic(e) => e.finish(),
+                Self::Block(e) => e.finish(),
+                Self::Huffman(e) => e.finish(),
+                Self::Rejection(e) => e.finish(),
+            }
+        }
+        fn cover_parts_len(&self) -> usize {
+            match self {
+                Self::Arithmetic(e) => e.cover_parts.len(),
+                Self::Block(e) => e.cover_parts.len(),
+                Self::Huffman(e) => e.cover_parts.len(),
+                Self::Rejection(e) => e.cover_parts.len(),
+            }
+        }
+    }
+
+    let mut encoder = match cmd.method.as_str() {
+        "arithmetic" => StreamEncoder::Arithmetic(
+            ArithmeticStreamEncoder::new(lm, config, cmd.arith_block_size, &context)
+        ),
+        "block" => StreamEncoder::Block(
+            BlockStreamEncoder::new(lm, config, cmd.block_bits, &context)?
+        ),
+        "huffman" => StreamEncoder::Huffman(
+            HuffmanStreamEncoder::new(lm, config, cmd.max_code_len, &context)
+        ),
+        "rejection" => StreamEncoder::Rejection(
+            RejectionStreamEncoder::new(lm, config, cmd.rejection_bits, &context)
+        ),
+        _ => return Err(format!("Unknown method: {}", cmd.method).into()),
+    };
 
     // Read stdin in chunks, frame each chunk, feed to encoder.
     let mut buf = [0u8; 4096];
@@ -396,7 +441,7 @@ fn stream_encode(
 
     if cmd.stats {
         eprintln!("--- Stats (streaming) ---");
-        eprintln!("Cover parts: {}", encoder.cover_parts.len());
+        eprintln!("Cover parts: {}", encoder.cover_parts_len());
     }
 
     Ok(())
@@ -407,15 +452,52 @@ fn stream_decode(
     lm: &dyn LanguageModel,
     config: StegaConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if cmd.method != "arithmetic" {
-        return Err("--stream is only supported with --method arithmetic.".into());
-    }
-
     let context = lm.tokenize(&cmd.context)?;
     let context_len = cmd.context.len();
-    let mut decoder = ArithmeticStreamDecoder::new(lm, config, cmd.arith_block_size, &context);
     let mut unframer = UnframeStream::new();
     let mut stdout = std::io::stdout();
+
+    // Create the appropriate streaming decoder for the method.
+    enum StreamDecoder<'a> {
+        Arithmetic(ArithmeticStreamDecoder<'a>),
+        Block(BlockStreamDecoder<'a>),
+        Huffman(HuffmanStreamDecoder<'a>),
+        Rejection(RejectionStreamDecoder<'a>),
+    }
+    impl<'a> StreamDecoder<'a> {
+        fn push_text(&mut self, text: &str) -> steganeur::error::Result<Vec<u8>> {
+            match self {
+                Self::Arithmetic(d) => d.push_text(text),
+                Self::Block(d) => d.push_text(text),
+                Self::Huffman(d) => d.push_text(text),
+                Self::Rejection(d) => d.push_text(text),
+            }
+        }
+        fn finish(&mut self) -> steganeur::error::Result<Vec<u8>> {
+            match self {
+                Self::Arithmetic(d) => d.finish(),
+                Self::Block(d) => d.finish(),
+                Self::Huffman(d) => d.finish(),
+                Self::Rejection(d) => d.finish(),
+            }
+        }
+    }
+
+    let mut decoder = match cmd.method.as_str() {
+        "arithmetic" => StreamDecoder::Arithmetic(
+            ArithmeticStreamDecoder::new(lm, config, cmd.arith_block_size, &context)
+        ),
+        "block" => StreamDecoder::Block(
+            BlockStreamDecoder::new(lm, config, cmd.block_bits, &context)?
+        ),
+        "huffman" => StreamDecoder::Huffman(
+            HuffmanStreamDecoder::new(lm, config, cmd.max_code_len, &context)
+        ),
+        "rejection" => StreamDecoder::Rejection(
+            RejectionStreamDecoder::new(lm, config, cmd.rejection_bits, &context)
+        ),
+        _ => return Err(format!("Unknown method: {}", cmd.method).into()),
+    };
 
     // Read stdin in chunks, feed to decoder, unframe, output.
     // The cover text starts with the context text, which the decoder must

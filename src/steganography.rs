@@ -893,6 +893,16 @@ impl<'a> HuffmanStega<'a> {
         Self::canonical_codes(&lengths, token_ids)
     }
 
+    /// Static version of build_huffman_tree for use by streaming encoders/decoders
+    /// that don't have a `self` reference.
+    fn build_huffman_tree_static(probs: &[f64], token_ids: &[TokenId], max_len: usize) -> Vec<(u64, usize)> {
+        if probs.is_empty() {
+            return vec![];
+        }
+        let lengths = Self::length_limited_lengths(probs, max_len);
+        Self::canonical_codes(&lengths, token_ids)
+    }
+
     pub fn encode(&self, context: &[TokenId], message: &[u8], num_msg_bits: usize) -> Result<(Vec<TokenId>, usize, String)> {
         let mut ctx = context.to_vec();
         let mut reader = BitReader::new(message);
@@ -1013,6 +1023,449 @@ impl<'a> HuffmanStega<'a> {
         let bytes = writer.finalize();
         let n2 = bytes.len() * 8;
         Ok((bytes, n2))
+    }
+}
+
+// ============================================================================
+// Streaming block encode/decode
+// ============================================================================
+
+/// Streaming block encoder. Encodes framed bytes into cover text,
+/// maintaining bit-buffer state across calls.
+pub struct BlockStreamEncoder<'a> {
+    lm: &'a dyn LanguageModel,
+    config: StegaConfig,
+    block_bits: usize,
+    token_to_bin: Vec<usize>,
+    context: Vec<TokenId>,
+    message_bits: Vec<u8>,
+    bit_pos: usize,
+    pub cover_parts: Vec<String>,
+    finished: bool,
+}
+
+impl<'a> BlockStreamEncoder<'a> {
+    pub fn new(lm: &'a dyn LanguageModel, config: StegaConfig, block_bits: usize, context: &[TokenId]) -> Result<Self> {
+        let vocab_size = lm.vocab_size();
+        let num_bins = 1usize << block_bits;
+        let mut rng = StdRng::seed_from_u64(0x53544147414E4F00);
+        let mut token_to_bin = vec![0usize; vocab_size];
+        for bin in token_to_bin.iter_mut() { *bin = rng.gen_range(0..num_bins); }
+        Ok(BlockStreamEncoder {
+            lm, config, block_bits, token_to_bin,
+            context: context.to_vec(),
+            message_bits: Vec::new(),
+            bit_pos: 0,
+            cover_parts: Vec::new(),
+            finished: false,
+        })
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<String> {
+        if self.finished { return Ok(String::new()); }
+        for &byte in bytes {
+            for j in (0..8).rev() {
+                self.message_bits.push((byte >> j) & 1);
+            }
+        }
+        self.encode_step(false)
+    }
+
+    pub fn finish(&mut self) -> Result<String> {
+        if self.finished { return Ok(String::new()); }
+        self.finished = true;
+        let mut cover = self.encode_step(true)?;
+        // Add punctuation if needed.
+        if self.cover_parts.last().is_none_or(|s| !arithmetic::is_sentence_end(s)) {
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if let Some((punct_id, punct_str)) = find_punctuation_token(&filtered.ids, &filtered.strings) {
+                self.context.push(punct_id);
+                self.cover_parts.push(punct_str.clone());
+                cover.push_str(&punct_str);
+            }
+        }
+        Ok(cover)
+    }
+
+    fn encode_step(&mut self, flush: bool) -> Result<String> {
+        let eos = self.lm.eos_token();
+        let new_cover_start = self.cover_parts.len();
+
+        for _ in 0..self.config.max_tokens {
+            // Check if we have enough bits to encode another token.
+            let remaining = self.message_bits.len().saturating_sub(self.bit_pos);
+            if !flush && remaining < self.block_bits + self.block_bits {
+                break; // Reserve enough for the next chunk + safety
+            }
+            if remaining == 0 {
+                break;
+            }
+
+            // Read block_bits from the bit buffer, zero-padding if needed.
+            let mut block = 0usize;
+            for j in 0..self.block_bits {
+                let bit = if self.bit_pos + j < self.message_bits.len() {
+                    self.message_bits[self.bit_pos + j]
+                } else {
+                    0
+                };
+                block = (block << 1) | (bit as usize);
+            }
+            self.bit_pos += self.block_bits;
+
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            let mut best_token = None;
+            let mut best_prob = f64::NEG_INFINITY;
+            let mut best_str = String::new();
+            for (i, (&id, &prob)) in filtered.ids.iter().zip(filtered.probs.iter()).enumerate() {
+                let id_usize = id as usize;
+                if id_usize >= self.token_to_bin.len() { continue; }
+                if self.token_to_bin[id_usize] != block { continue; }
+                if prob > best_prob {
+                    best_prob = prob;
+                    best_token = Some(id);
+                    best_str = filtered.strings[i].clone();
+                }
+            }
+            let token = match best_token {
+                Some(t) => t,
+                None => {
+                    let mut fallback_id = 0u32;
+                    let mut fb_prob = f64::NEG_INFINITY;
+                    for (i, (&id, &prob)) in filtered.ids.iter().zip(filtered.probs.iter()).enumerate() {
+                        if prob > fb_prob {
+                            fb_prob = prob;
+                            fallback_id = id;
+                            best_str = filtered.strings[i].clone();
+                        }
+                    }
+                    fallback_id
+                }
+            };
+            self.context.push(token);
+            self.cover_parts.push(best_str);
+            if let Some(et) = eos && token == et { break; }
+        }
+
+        Ok(self.cover_parts[new_cover_start..].concat())
+    }
+}
+
+/// Streaming block decoder. Matches cover text against token strings,
+/// recovers bits from bin lookups, returns complete bytes.
+pub struct BlockStreamDecoder<'a> {
+    lm: &'a dyn LanguageModel,
+    config: StegaConfig,
+    block_bits: usize,
+    token_to_bin: Vec<usize>,
+    context: Vec<TokenId>,
+    message_bits: Vec<u8>,
+    bits_returned: usize,
+    text_buffer: String,
+    finishing: bool,
+}
+
+impl<'a> BlockStreamDecoder<'a> {
+    pub fn new(lm: &'a dyn LanguageModel, config: StegaConfig, block_bits: usize, context: &[TokenId]) -> Result<Self> {
+        let vocab_size = lm.vocab_size();
+        let num_bins = 1usize << block_bits;
+        let mut rng = StdRng::seed_from_u64(0x53544147414E4F00);
+        let mut token_to_bin = vec![0usize; vocab_size];
+        for bin in token_to_bin.iter_mut() { *bin = rng.gen_range(0..num_bins); }
+        Ok(BlockStreamDecoder {
+            lm, config, block_bits, token_to_bin,
+            context: context.to_vec(),
+            message_bits: Vec::new(),
+            bits_returned: 0,
+            text_buffer: String::new(),
+            finishing: false,
+        })
+    }
+
+    pub fn push_text(&mut self, text: &str) -> Result<Vec<u8>> {
+        self.text_buffer.push_str(text);
+        self.decode_step()
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<u8>> {
+        self.finishing = true;
+        self.decode_step()?;
+        self.flush_remaining()
+    }
+
+    fn flush_remaining(&mut self) -> Result<Vec<u8>> {
+        let remaining = &self.message_bits[self.bits_returned..];
+        let mut bytes = Vec::with_capacity(remaining.len().div_ceil(8));
+        for chunk in remaining.chunks(8) {
+            let mut b = 0u8;
+            for (j, &bit) in chunk.iter().enumerate() { b |= bit << (7 - j); }
+            bytes.push(b);
+        }
+        self.bits_returned = self.message_bits.len();
+        Ok(bytes)
+    }
+
+    fn decode_step(&mut self) -> Result<Vec<u8>> {
+        loop {
+            if self.text_buffer.is_empty() { break; }
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if filtered.probs.is_empty() { break; }
+
+            let mut matched = None;
+            let mut best_len = 0usize;
+            for (i, token_str) in filtered.strings.iter().enumerate() {
+                if token_str.is_empty() { continue; }
+                if token_str.len() > best_len && self.text_buffer.starts_with(token_str.as_str()) {
+                    let id = filtered.ids[i] as usize;
+                    if id < self.token_to_bin.len() && token_str.len() > best_len {
+                        matched = Some((id, token_str.len()));
+                        best_len = token_str.len();
+                    }
+                }
+            }
+
+            if let Some((id, len)) = matched {
+                let bin = self.token_to_bin[id];
+                for j in (0..self.block_bits).rev() {
+                    self.message_bits.push(((bin >> j) & 1) as u8);
+                }
+                self.context.push(id as TokenId);
+                self.text_buffer.drain(..len);
+            } else {
+                if self.finishing {
+                    let skip = self.text_buffer.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    if skip >= self.text_buffer.len() {
+                        self.text_buffer.clear();
+                    } else {
+                        self.text_buffer.drain(..skip);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let complete_bits = (self.message_bits.len() / 8) * 8;
+        let new_bits = &self.message_bits[self.bits_returned..complete_bits];
+        let mut bytes = Vec::with_capacity(new_bits.len() / 8);
+        for chunk in new_bits.chunks(8) {
+            let mut b = 0u8;
+            for (j, &bit) in chunk.iter().enumerate() { b |= bit << (7 - j); }
+            bytes.push(b);
+        }
+        self.bits_returned = complete_bits;
+        Ok(bytes)
+    }
+}
+
+// ============================================================================
+// Streaming huffman encode/decode
+// ============================================================================
+
+/// Streaming huffman encoder. Encodes framed bytes into cover text,
+/// maintaining bit-buffer and code-matching state across calls.
+pub struct HuffmanStreamEncoder<'a> {
+    lm: &'a dyn LanguageModel,
+    config: StegaConfig,
+    max_code_len: usize,
+    context: Vec<TokenId>,
+    message_bits: Vec<u8>,
+    bit_pos: usize,
+    pub cover_parts: Vec<String>,
+    finished: bool,
+}
+
+impl<'a> HuffmanStreamEncoder<'a> {
+    pub fn new(lm: &'a dyn LanguageModel, config: StegaConfig, max_code_len: usize, context: &[TokenId]) -> Self {
+        HuffmanStreamEncoder {
+            lm, config, max_code_len,
+            context: context.to_vec(),
+            message_bits: Vec::new(),
+            bit_pos: 0,
+            cover_parts: Vec::new(),
+            finished: false,
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<String> {
+        if self.finished { return Ok(String::new()); }
+        for &byte in bytes {
+            for j in (0..8).rev() {
+                self.message_bits.push((byte >> j) & 1);
+            }
+        }
+        self.encode_step(false)
+    }
+
+    pub fn finish(&mut self) -> Result<String> {
+        if self.finished { return Ok(String::new()); }
+        self.finished = true;
+        let mut cover = self.encode_step(true)?;
+        if self.cover_parts.last().is_none_or(|s| !arithmetic::is_sentence_end(s)) {
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if let Some((punct_id, punct_str)) = find_punctuation_token(&filtered.ids, &filtered.strings) {
+                self.context.push(punct_id);
+                self.cover_parts.push(punct_str.clone());
+                cover.push_str(&punct_str);
+            }
+        }
+        Ok(cover)
+    }
+
+    fn encode_step(&mut self, flush: bool) -> Result<String> {
+        let eos = self.lm.eos_token();
+        let new_cover_start = self.cover_parts.len();
+        let max_tokens = self.config.max_tokens.max(DEFAULT_MAX_TOKENS);
+
+        for _ in 0..max_tokens {
+            let remaining = self.message_bits.len().saturating_sub(self.bit_pos);
+            // Reserve max_code_len bits so we don't start a code we can't finish.
+            if !flush && remaining < self.max_code_len * 2 {
+                break;
+            }
+            if remaining == 0 {
+                break;
+            }
+
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if filtered.probs.is_empty() { break; }
+            let huff_codes = HuffmanStega::build_huffman_tree_static(&filtered.probs, &filtered.ids, self.max_code_len);
+            if huff_codes.is_empty() { break; }
+
+            let mut matched = None;
+            let mut code_buf = 0u64;
+            let mut code_len = 0;
+            while code_len < self.max_code_len {
+                let bit = if self.bit_pos < self.message_bits.len() {
+                    self.message_bits[self.bit_pos]
+                } else {
+                    0 // zero-padding
+                };
+                code_buf = (code_buf << 1) | (bit as u64);
+                self.bit_pos += 1;
+                code_len += 1;
+                for (i, &(code, len)) in huff_codes.iter().enumerate() {
+                    if len == code_len && code == code_buf { matched = Some(i); break; }
+                }
+                if matched.is_some() { break; }
+            }
+
+            let token_idx = match matched {
+                Some(idx) => idx,
+                None => break, // can't match, wait for more bits
+            };
+            let token = filtered.ids[token_idx];
+            let token_str = filtered.strings.get(token_idx).cloned().unwrap_or_default();
+            self.context.push(token);
+            self.cover_parts.push(token_str);
+            if let Some(et) = eos && token == et { break; }
+        }
+
+        Ok(self.cover_parts[new_cover_start..].concat())
+    }
+}
+
+/// Streaming huffman decoder. Matches cover text against token strings,
+/// recovers variable-length codes, returns complete bytes.
+pub struct HuffmanStreamDecoder<'a> {
+    lm: &'a dyn LanguageModel,
+    config: StegaConfig,
+    max_code_len: usize,
+    context: Vec<TokenId>,
+    message_bits: Vec<u8>,
+    bits_returned: usize,
+    text_buffer: String,
+    finishing: bool,
+}
+
+impl<'a> HuffmanStreamDecoder<'a> {
+    pub fn new(lm: &'a dyn LanguageModel, config: StegaConfig, max_code_len: usize, context: &[TokenId]) -> Self {
+        HuffmanStreamDecoder {
+            lm, config, max_code_len,
+            context: context.to_vec(),
+            message_bits: Vec::new(),
+            bits_returned: 0,
+            text_buffer: String::new(),
+            finishing: false,
+        }
+    }
+
+    pub fn push_text(&mut self, text: &str) -> Result<Vec<u8>> {
+        self.text_buffer.push_str(text);
+        self.decode_step()
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<u8>> {
+        self.finishing = true;
+        self.decode_step()?;
+        self.flush_remaining()
+    }
+
+    fn flush_remaining(&mut self) -> Result<Vec<u8>> {
+        let remaining = &self.message_bits[self.bits_returned..];
+        let mut bytes = Vec::with_capacity(remaining.len().div_ceil(8));
+        for chunk in remaining.chunks(8) {
+            let mut b = 0u8;
+            for (j, &bit) in chunk.iter().enumerate() { b |= bit << (7 - j); }
+            bytes.push(b);
+        }
+        self.bits_returned = self.message_bits.len();
+        Ok(bytes)
+    }
+
+    fn decode_step(&mut self) -> Result<Vec<u8>> {
+        loop {
+            if self.text_buffer.is_empty() { break; }
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if filtered.probs.is_empty() { break; }
+            let codes = HuffmanStega::build_huffman_tree_static(&filtered.probs, &filtered.ids, self.max_code_len);
+            if codes.is_empty() { break; }
+
+            let mut matched = None;
+            let mut best_len = 0usize;
+            for (i, token_str) in filtered.strings.iter().enumerate() {
+                if token_str.is_empty() { continue; }
+                if token_str.len() > best_len && self.text_buffer.starts_with(token_str.as_str()) {
+                    matched = Some((i, filtered.ids[i], token_str.len()));
+                    best_len = token_str.len();
+                }
+            }
+
+            if let Some((idx, _token_id, len)) = matched {
+                if idx < codes.len() {
+                    let (code, code_len) = codes[idx];
+                    if code_len > 0 {
+                        for j in (0..code_len).rev() {
+                            self.message_bits.push(((code >> j) & 1) as u8);
+                        }
+                    }
+                }
+                self.context.push(filtered.ids[idx]);
+                self.text_buffer.drain(..len);
+            } else {
+                if self.finishing {
+                    let skip = self.text_buffer.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    if skip >= self.text_buffer.len() {
+                        self.text_buffer.clear();
+                    } else {
+                        self.text_buffer.drain(..skip);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let complete_bits = (self.message_bits.len() / 8) * 8;
+        let new_bits = &self.message_bits[self.bits_returned..complete_bits];
+        let mut bytes = Vec::with_capacity(new_bits.len() / 8);
+        for chunk in new_bits.chunks(8) {
+            let mut b = 0u8;
+            for (j, &bit) in chunk.iter().enumerate() { b |= bit << (7 - j); }
+            bytes.push(b);
+        }
+        self.bits_returned = complete_bits;
+        Ok(bytes)
     }
 }
 
@@ -1217,6 +1670,170 @@ mod stream_tests {
         }
         let final_bytes = decoder.finish().unwrap();
         all_bytes.extend(final_bytes);
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
+    }
+}
+
+#[cfg(test)]
+mod block_stream_tests {
+    use super::*;
+    use crate::framing::{frame_chunk, frame_end, UnframeStream};
+    use crate::lm::{DummyLM, LanguageModel};
+
+    fn make_lm(vocab: usize) -> DummyLM {
+        let probs: Vec<f64> = (0..vocab)
+            .map(|i| 1.0 / (i as f64 + 1.0))
+            .collect();
+        let strings: Vec<String> = (0..vocab)
+            .map(|i| format!("t{} ", i))
+            .collect();
+        DummyLM::new(vocab)
+            .with_probs(probs)
+            .with_token_strings(strings)
+    }
+
+    #[test]
+    fn test_block_stream_roundtrip() {
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 500,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret = b"Block streaming test message";
+        let mut encoder = BlockStreamEncoder::new(&lm, config.clone(), 2, &ctx).unwrap();
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+        assert!(!cover.is_empty());
+
+        let mut decoder = BlockStreamDecoder::new(&lm, config, 2, &ctx).unwrap();
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
+    }
+
+    #[test]
+    fn test_block_stream_binary_with_nulls() {
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 500,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret: Vec<u8> = vec![0x00, 0xAB, 0x00, 0x00, 0xCD, 0xFF, 0x00, 0x42];
+        let mut encoder = BlockStreamEncoder::new(&lm, config.clone(), 2, &ctx).unwrap();
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(&secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+
+        let mut decoder = BlockStreamDecoder::new(&lm, config, 2, &ctx).unwrap();
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
+    }
+}
+
+#[cfg(test)]
+mod huffman_stream_tests {
+    use super::*;
+    use crate::framing::{frame_chunk, frame_end, UnframeStream};
+    use crate::lm::{DummyLM, LanguageModel};
+
+    fn make_lm(vocab: usize) -> DummyLM {
+        let probs: Vec<f64> = (0..vocab)
+            .map(|i| 1.0 / (i as f64 + 1.0))
+            .collect();
+        let strings: Vec<String> = (0..vocab)
+            .map(|i| format!("t{} ", i))
+            .collect();
+        DummyLM::new(vocab)
+            .with_probs(probs)
+            .with_token_strings(strings)
+    }
+
+    #[test]
+    fn test_huffman_stream_roundtrip() {
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 500,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret = b"Huffman streaming test";
+        let mut encoder = HuffmanStreamEncoder::new(&lm, config.clone(), 16, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+        assert!(!cover.is_empty());
+
+        let mut decoder = HuffmanStreamDecoder::new(&lm, config, 16, &ctx);
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
+    }
+
+    #[test]
+    fn test_huffman_stream_binary_with_nulls() {
+        let vocab = 64;
+        let lm = make_lm(vocab);
+        let config = StegaConfig {
+            temperature: 2.0,
+            top_k: 50,
+            max_tokens: 500,
+            seed: None,
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret: Vec<u8> = vec![0x00, 0xAB, 0x00, 0x00, 0xCD, 0xFF, 0x00, 0x42];
+        let mut encoder = HuffmanStreamEncoder::new(&lm, config.clone(), 16, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(&secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+
+        let mut decoder = HuffmanStreamDecoder::new(&lm, config, 16, &ctx);
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
 
         let mut unframer = UnframeStream::new();
         let chunks = unframer.push(&all_bytes).unwrap();

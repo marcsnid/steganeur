@@ -367,6 +367,345 @@ impl<'a> RejectionStega<'a> {
     }
 }
 
+// ============================================================================
+// Streaming rejection encode/decode
+// ============================================================================
+
+/// Streaming rejection encoder. Encodes framed bytes into cover text using
+/// rejection sampling, maintaining RNG and bit-buffer state across calls.
+pub struct RejectionStreamEncoder<'a> {
+    lm: &'a dyn LanguageModel,
+    config: StegaConfig,
+    bits: usize,
+    rng: StdRng,
+    context: Vec<TokenId>,
+    message_bits: Vec<u8>,
+    bit_pos: usize,
+    pub cover_parts: Vec<String>,
+    finished: bool,
+}
+
+impl<'a> RejectionStreamEncoder<'a> {
+    pub fn new(lm: &'a dyn LanguageModel, config: StegaConfig, bits: usize, context: &[TokenId]) -> Self {
+        let rng: StdRng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
+        RejectionStreamEncoder {
+            lm, config, bits, rng,
+            context: context.to_vec(),
+            message_bits: Vec::new(),
+            bit_pos: 0,
+            cover_parts: Vec::new(),
+            finished: false,
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<String> {
+        if self.finished { return Ok(String::new()); }
+        for &byte in bytes {
+            for j in (0..8).rev() {
+                self.message_bits.push((byte >> j) & 1);
+            }
+        }
+        self.encode_step(false)
+    }
+
+    pub fn finish(&mut self) -> Result<String> {
+        if self.finished { return Ok(String::new()); }
+        self.finished = true;
+        let mut cover = self.encode_step(true)?;
+        if self.cover_parts.last().is_none_or(|s| !crate::arithmetic::is_sentence_end(s)) {
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            if let Some((punct_id, punct_str)) = find_punctuation_token(&filtered.ids, &filtered.strings) {
+                self.context.push(punct_id);
+                self.cover_parts.push(punct_str.clone());
+                cover.push_str(&punct_str);
+            }
+        }
+        Ok(cover)
+    }
+
+    fn encode_step(&mut self, flush: bool) -> Result<String> {
+        let eos = self.lm.eos_token();
+        let new_cover_start = self.cover_parts.len();
+        let num_bins = 1usize << self.bits;
+        let max_retries = 10 * num_bins;
+
+        for _ in 0..self.config.max_tokens {
+            let remaining = self.message_bits.len().saturating_sub(self.bit_pos);
+            if !flush && remaining < self.bits + self.bits {
+                break; // Reserve enough for the next chunk + safety
+            }
+            if remaining < self.bits {
+                break;
+            }
+
+            // Read target bin from message bits
+            let target_bin = {
+                let mut bin = 0usize;
+                for j in 0..self.bits {
+                    let bit = if self.bit_pos + j < self.message_bits.len() {
+                        self.message_bits[self.bit_pos + j]
+                    } else {
+                        0
+                    };
+                    bin = (bin << 1) | (bit as usize);
+                }
+                bin
+            };
+            self.bit_pos += self.bits;
+
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            let table = FreqTable::from_probs(&filtered.probs, MAX_FREQ);
+            let total = table.total;
+            if total == 0 || table.is_empty() { break; }
+
+            let bin_bounds = RejectionStega::build_bin_bounds(&table.cum, total, num_bins);
+            let token_bins: Vec<usize> = (0..filtered.ids.len())
+                .map(|i| RejectionStega::token_to_bin(i, &table.cum, &bin_bounds))
+                .collect();
+
+            let mut best_in_target_idx = usize::MAX;
+            let total_tokens = filtered.ids.len();
+            let mut accepted: Option<(TokenId, usize)> = None;
+
+            for _attempt in 0..max_retries {
+                let u = self.rng.gen_range(0..total);
+                let token_idx = match table.cum.binary_search(&u) {
+                    Ok(i) => i,
+                    Err(i) => i.saturating_sub(1),
+                };
+                if token_idx >= total_tokens { continue; }
+                if token_bins[token_idx] == target_bin {
+                    if best_in_target_idx == usize::MAX {
+                        best_in_target_idx = token_idx;
+                    }
+                    accepted = Some((filtered.ids[token_idx], token_idx));
+                    break;
+                }
+            }
+
+            let (token, token_idx) = match accepted {
+                Some((t, idx)) => (t, idx),
+                None => {
+                    if best_in_target_idx != usize::MAX {
+                        (filtered.ids[best_in_target_idx], best_in_target_idx)
+                    } else {
+                        let mut best_t = filtered.ids[0];
+                        let mut best_p = f64::NEG_INFINITY;
+                        let mut best_i = 0;
+                        for (i, (&id, &prob)) in filtered.ids.iter().zip(filtered.probs.iter()).enumerate() {
+                            if token_bins[i] == target_bin && prob > best_p {
+                                best_p = prob;
+                                best_t = id;
+                                best_i = i;
+                            }
+                        }
+                        (best_t, best_i)
+                    }
+                }
+            };
+
+            let token_str = if token_idx < filtered.strings.len() {
+                filtered.strings[token_idx].clone()
+            } else {
+                String::new()
+            };
+            self.context.push(token);
+            self.cover_parts.push(token_str);
+            if let Some(et) = eos && token == et { break; }
+        }
+
+        Ok(self.cover_parts[new_cover_start..].concat())
+    }
+}
+
+/// Streaming rejection decoder. Matches cover text against token strings,
+/// recovers bits from bin lookups, returns complete bytes.
+pub struct RejectionStreamDecoder<'a> {
+    lm: &'a dyn LanguageModel,
+    config: StegaConfig,
+    bits: usize,
+    context: Vec<TokenId>,
+    message_bits: Vec<u8>,
+    bits_returned: usize,
+    text_buffer: String,
+    finishing: bool,
+}
+
+impl<'a> RejectionStreamDecoder<'a> {
+    pub fn new(lm: &'a dyn LanguageModel, config: StegaConfig, bits: usize, context: &[TokenId]) -> Self {
+        RejectionStreamDecoder {
+            lm, config, bits,
+            context: context.to_vec(),
+            message_bits: Vec::new(),
+            bits_returned: 0,
+            text_buffer: String::new(),
+            finishing: false,
+        }
+    }
+
+    pub fn push_text(&mut self, text: &str) -> Result<Vec<u8>> {
+        self.text_buffer.push_str(text);
+        self.decode_step()
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<u8>> {
+        self.finishing = true;
+        self.decode_step()?;
+        self.flush_remaining()
+    }
+
+    fn flush_remaining(&mut self) -> Result<Vec<u8>> {
+        let remaining = &self.message_bits[self.bits_returned..];
+        let mut bytes = Vec::with_capacity(remaining.len().div_ceil(8));
+        for chunk in remaining.chunks(8) {
+            let mut b = 0u8;
+            for (j, &bit) in chunk.iter().enumerate() { b |= bit << (7 - j); }
+            bytes.push(b);
+        }
+        self.bits_returned = self.message_bits.len();
+        Ok(bytes)
+    }
+
+    fn decode_step(&mut self) -> Result<Vec<u8>> {
+        let num_bins = 1usize << self.bits;
+        loop {
+            if self.text_buffer.is_empty() { break; }
+            let filtered = filter_distribution(self.lm, &self.context, &self.config)?;
+            let table = FreqTable::from_probs(&filtered.probs, MAX_FREQ);
+            if table.total == 0 || table.is_empty() { break; }
+
+            let bin_bounds = RejectionStega::build_bin_bounds(&table.cum, table.total, num_bins);
+
+            let mut matched = None;
+            let mut best_len = 0usize;
+            for (i, token_str) in filtered.strings.iter().enumerate() {
+                if token_str.is_empty() { continue; }
+                if token_str.len() > best_len && self.text_buffer.starts_with(token_str.as_str()) {
+                    matched = Some((i, filtered.ids[i], token_str.len()));
+                    best_len = token_str.len();
+                }
+            }
+
+            if let Some((idx, _token_id, len)) = matched {
+                let bin = RejectionStega::token_to_bin(idx, &table.cum, &bin_bounds);
+                for j in (0..self.bits).rev() {
+                    self.message_bits.push(((bin >> j) & 1) as u8);
+                }
+                self.context.push(filtered.ids[idx]);
+                self.text_buffer.drain(..len);
+            } else {
+                if self.finishing {
+                    let skip = self.text_buffer.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    if skip >= self.text_buffer.len() {
+                        self.text_buffer.clear();
+                    } else {
+                        self.text_buffer.drain(..skip);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let complete_bits = (self.message_bits.len() / 8) * 8;
+        let new_bits = &self.message_bits[self.bits_returned..complete_bits];
+        let mut bytes = Vec::with_capacity(new_bits.len() / 8);
+        for chunk in new_bits.chunks(8) {
+            let mut b = 0u8;
+            for (j, &bit) in chunk.iter().enumerate() { b |= bit << (7 - j); }
+            bytes.push(b);
+        }
+        self.bits_returned = complete_bits;
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::framing::{frame_chunk, frame_end, UnframeStream};
+    use crate::lm::{DummyLM, LanguageModel};
+    use crate::steganography::StegaConfig;
+
+    fn make_test_lm() -> DummyLM {
+        let probs: Vec<f64> = vec![
+            0.15, 0.12, 0.10, 0.08, 0.07, 0.06, 0.05, 0.05, 0.04, 0.04, 0.03, 0.03, 0.03, 0.03,
+            0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,
+            0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,
+        ];
+        let strings: Vec<String> = (0..probs.len())
+            .map(|i| format!("word{} ", i))
+            .collect();
+        DummyLM::new(probs.len())
+            .with_probs(probs)
+            .with_token_strings(strings)
+    }
+
+    #[test]
+    fn test_rejection_stream_roundtrip() {
+        let lm = make_test_lm();
+        let config = StegaConfig {
+            temperature: 1.0,
+            top_k: 10,
+            max_tokens: 200,
+            seed: Some(42),
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret = b"Rejection streaming test";
+        let mut encoder = RejectionStreamEncoder::new(&lm, config.clone(), 2, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+        assert!(!cover.is_empty());
+
+        let mut decoder = RejectionStreamDecoder::new(&lm, config, 2, &ctx);
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
+    }
+
+    #[test]
+    fn test_rejection_stream_binary_with_nulls() {
+        let lm = make_test_lm();
+        let config = StegaConfig {
+            temperature: 1.0,
+            top_k: 10,
+            max_tokens: 200,
+            seed: Some(42),
+        };
+        let ctx = lm.tokenize("ctx").unwrap();
+
+        let secret: Vec<u8> = vec![0x00, 0xAB, 0x00, 0x00, 0xCD, 0xFF, 0x00, 0x42];
+        let mut encoder = RejectionStreamEncoder::new(&lm, config.clone(), 2, &ctx);
+        let mut cover = String::new();
+        cover.push_str(&encoder.push_bytes(&frame_chunk(&secret)).unwrap());
+        cover.push_str(&encoder.push_bytes(&frame_end()).unwrap());
+        cover.push_str(&encoder.finish().unwrap());
+
+        let mut decoder = RejectionStreamDecoder::new(&lm, config, 2, &ctx);
+        let recovered = decoder.push_text(&cover).unwrap();
+        let final_bytes = decoder.finish().unwrap();
+        let all_bytes = [recovered.as_slice(), final_bytes.as_slice()].concat();
+
+        let mut unframer = UnframeStream::new();
+        let chunks = unframer.push(&all_bytes).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], secret);
+        assert!(unframer.is_done());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
