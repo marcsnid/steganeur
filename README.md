@@ -367,6 +367,44 @@ spreads the probability mass, giving more room for message bits.
 For the arithmetic method, use 2.0 or higher. The block method is less
 sensitive to temperature.
 
+## Streaming
+
+By default, steganeur reads the entire message into memory before encoding,
+and reads the entire cover text before decoding. The `--stream` flag enables
+incremental I/O: stdin is read in chunks and output is produced as it becomes
+available. This matters for large messages where buffering the whole payload
+and cover text would be impractical.
+
+Streaming works with all four methods. Encode generates cover text as message
+bytes arrive; decode recovers message bytes as cover text arrives.
+
+**Encode (streaming):**
+
+```bash
+cat large_message.bin \
+  | steganeur encode --stream --method block --block-bits 2 \
+    --temperature 2.0 --top-k 300 \
+    --context "She walked through the forest" \
+    --llama-url "http://127.0.0.1:11434" \
+    --model "Qwen3.6-27B-GGUF" \
+    --vocab-size 152064 --eos-token 151643
+```
+
+**Decode (streaming):**
+
+```bash
+cat cover.txt \
+  | steganeur decode --stream --method block --block-bits 2 \
+    --temperature 2.0 --top-k 300 \
+    --context "She walked through the forest" \
+    --llama-url "http://127.0.0.1:11434" \
+    --model "Qwen3.6-27B-GGUF" \
+    --vocab-size 152064 --eos-token 151643
+```
+
+The encode and decode flags (method, temperature, top-k, block-bits, etc.) must
+match between sender and receiver, same as batch mode.
+
 ## Testing without a server
 
 ```bash
